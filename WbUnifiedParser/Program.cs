@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -73,9 +74,13 @@ internal static class Program
         Console.WriteLine($"Найдено уникальных товаров: {rows.Count}");
 
         if (skipEnrichment)
+        {
             Console.WriteLine("Сетевое обогащение пропущено: указан флаг --offline.");
+        }
         else
+        {
             await WbEnricher.EnrichAsync(rows);
+        }
 
         ExcelWriter.Save(rows, outputPath);
 
@@ -134,6 +139,7 @@ internal static class Program
 
 internal sealed class WbProduct
 {
+    public string? Brand { get; set; }
     public long Id { get; set; }
     public long SupplierId { get; set; }
     public string? Supplier { get; set; }
@@ -141,6 +147,9 @@ internal sealed class WbProduct
     public string? Entity { get; set; }
     public int SubjectId { get; set; }
     public int SubjectParentId { get; set; }
+    public decimal NmReviewRating { get; set; }
+    public int NmFeedbacks { get; set; }
+    public int Questions { get; set; }
 }
 
 internal sealed class WbRoot
@@ -152,12 +161,22 @@ internal sealed class WbRow
 {
     public string SourceFile { get; init; } = "";
     public long ProductId { get; init; }
-    public string ProductName { get; init; } = "";
+    public string ProductName { get; set; } = "";
+    public string BrandName { get; set; } = "";
+    public decimal? Rating { get; set; }
+    public int? ReviewCount { get; set; }
+    public int? QuestionCount { get; set; }
     public string Category { get; init; } = "";
     public int CategoryId { get; init; }
     public string ParentCategory { get; init; } = "";
     public int ParentCategoryId { get; init; }
     public string Entity { get; init; } = "";
+    public string Composition { get; set; } = "";
+    public string PackageCount { get; set; } = "";
+    public string CapsuleTabletCount { get; set; } = "";
+    public string Taste { get; set; } = "";
+    public string SupplementPurpose { get; set; } = "";
+    public string CountryOfOrigin { get; set; } = "";
     public long SellerId { get; init; }
     public string SellerName { get; init; } = "";
     public string SellerUrl => $"https://www.wildberries.ru/seller/{SellerId}";
@@ -205,6 +224,10 @@ internal static class WbJsonParser
                     SourceFile = sourceFile,
                     ProductId = product.Id,
                     ProductName = product.Name ?? "",
+                    BrandName = product.Brand ?? "",
+                    Rating = product.NmReviewRating > 0 ? product.NmReviewRating : null,
+                    ReviewCount = product.NmFeedbacks > 0 ? product.NmFeedbacks : null,
+                    QuestionCount = product.Questions > 0 ? product.Questions : null,
                     Category = category.Item1,
                     CategoryId = product.SubjectId,
                     ParentCategory = category.Item2,
@@ -252,6 +275,7 @@ internal static class WbEnricher
 
         var sellerCache = new Dictionary<long, SellerDetails>();
         var productCache = new Dictionary<long, ProductDetails>();
+        var feedbackCache = new Dictionary<long, FeedbackDetails>();
 
         for (var i = 0; i < rows.Count; i++)
         {
@@ -274,10 +298,34 @@ internal static class WbEnricher
                 productCache[row.ProductId] = product;
             }
 
+            if (!string.IsNullOrWhiteSpace(product.CardName))
+                row.ProductName = product.CardName;
+
+            if (!string.IsNullOrWhiteSpace(product.BrandName))
+                row.BrandName = product.BrandName;
+
+            row.Composition = product.Composition;
+            row.PackageCount = product.PackageCount;
+            row.CapsuleTabletCount = product.CapsuleTabletCount;
+            row.Taste = product.Taste;
+            row.SupplementPurpose = product.SupplementPurpose;
+            row.CountryOfOrigin = product.CountryOfOrigin;
             row.MainInfo = product.MainInfo;
             row.ExtraInfo = product.ExtraInfo;
             row.Description = product.Description;
             row.Documents = product.Documents;
+
+            if (product.ImtId <= 0)
+                continue;
+
+            if (!feedbackCache.TryGetValue(product.ImtId, out var feedback))
+            {
+                feedback = await GetFeedbackDetailsAsync(http, product.ImtId);
+                feedbackCache[product.ImtId] = feedback;
+            }
+
+            row.Rating ??= feedback.Rating;
+            row.ReviewCount ??= feedback.ReviewCount;
         }
     }
 
@@ -342,15 +390,34 @@ internal static class WbEnricher
             }
         }
 
-        return new ProductDetails("", "", "Описание не найдено", "Отсутствует");
+        return new ProductDetails(
+            0,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "Описание не найдено",
+            "Отсутствует");
     }
 
     private static ProductDetails ParseProductDetails(JsonElement root)
     {
+        var imtId = GetLong(root, "imt_id");
+        var cardName = GetString(root, "imt_name").Trim();
+        var brandName = root.TryGetProperty("selling", out var selling)
+            ? GetString(selling, "brand_name").Trim()
+            : "";
         var description = GetString(root, "description").Trim();
         var mainInfo = new StringBuilder();
         var extraInfo = new StringBuilder();
         var documents = new StringBuilder();
+        var optionLookup = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         if (root.TryGetProperty("grouped_options", out var groups)
             && groups.ValueKind == JsonValueKind.Array)
@@ -372,15 +439,15 @@ internal static class WbEnricher
                     _ => null
                 };
 
-                if (target == null)
-                    continue;
-
                 foreach (var option in options.EnumerateArray())
                 {
                     var name = GetString(option, "name");
                     var value = GetValueAsText(option, "value");
 
-                    if (!string.IsNullOrWhiteSpace(name) || !string.IsNullOrWhiteSpace(value))
+                    if (!string.IsNullOrWhiteSpace(name) && !optionLookup.ContainsKey(name))
+                        optionLookup[name] = value;
+
+                    if (target != null && (!string.IsNullOrWhiteSpace(name) || !string.IsNullOrWhiteSpace(value)))
                         target.AppendLine($"{name}: {value}".Trim());
                 }
             }
@@ -388,10 +455,59 @@ internal static class WbEnricher
 
         var documentText = documents.ToString().Trim();
         return new ProductDetails(
+            imtId,
+            cardName,
+            brandName,
+            GetOptionValue(optionLookup, "Состав"),
+            GetOptionValue(optionLookup, "Количество упаковок"),
+            GetOptionValue(optionLookup, "Количество капсул/таблеток"),
+            GetOptionValue(optionLookup, "Вкус"),
+            GetOptionValue(optionLookup, "Назначение добавки"),
+            GetOptionValue(optionLookup, "Страна производства"),
             mainInfo.ToString().Trim(),
             extraInfo.ToString().Trim(),
             description,
             string.IsNullOrWhiteSpace(documentText) ? "Отсутствует" : documentText);
+    }
+
+    private static async Task<FeedbackDetails> GetFeedbackDetailsAsync(HttpClient http, long imtId)
+    {
+        foreach (var host in new[] { "feedbacks1.wb.ru", "feedbacks2.wb.ru" })
+        {
+            var url = $"https://{host}/feedbacks/v1/{imtId}";
+
+            try
+            {
+                using var response = await http.GetAsync(url);
+                if (!response.IsSuccessStatusCode)
+                    continue;
+
+                await using var stream = await response.Content.ReadAsStreamAsync();
+                using var document = await JsonDocument.ParseAsync(stream);
+                var root = document.RootElement;
+
+                decimal? rating = null;
+                var ratingText = GetString(root, "valuation");
+                if (decimal.TryParse(
+                    ratingText,
+                    NumberStyles.AllowDecimalPoint,
+                    CultureInfo.InvariantCulture,
+                    out var parsedRating))
+                {
+                    rating = parsedRating;
+                }
+
+                return new FeedbackDetails(
+                    rating,
+                    GetNullableInt(root, "feedbackCount"));
+            }
+            catch
+            {
+                // Игнорируем ошибку конкретного хоста и пробуем следующий.
+            }
+        }
+
+        return new FeedbackDetails(null, null);
     }
 
     private static IEnumerable<int> GetBasketCandidates(long vol)
@@ -453,6 +569,36 @@ internal static class WbEnricher
             : value.ToString();
     }
 
+    private static long GetLong(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var value)
+            || value.ValueKind == JsonValueKind.Null
+            || value.ValueKind == JsonValueKind.Undefined)
+        {
+            return 0;
+        }
+
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt64(out var longValue))
+            return longValue;
+
+        return long.TryParse(value.ToString(), out var parsed) ? parsed : 0;
+    }
+
+    private static int? GetNullableInt(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var value)
+            || value.ValueKind == JsonValueKind.Null
+            || value.ValueKind == JsonValueKind.Undefined)
+        {
+            return null;
+        }
+
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var intValue))
+            return intValue;
+
+        return int.TryParse(value.ToString(), out var parsed) ? parsed : null;
+    }
+
     private static string GetValueAsText(JsonElement element, string propertyName)
     {
         if (!element.TryGetProperty(propertyName, out var value)
@@ -463,11 +609,16 @@ internal static class WbEnricher
         }
 
         if (value.ValueKind == JsonValueKind.Array)
-        {
             return string.Join(", ", value.EnumerateArray().Select(GetElementText));
-        }
 
         return GetElementText(value);
+    }
+
+    private static string GetOptionValue(
+        IReadOnlyDictionary<string, string> optionLookup,
+        string optionName)
+    {
+        return optionLookup.TryGetValue(optionName, out var value) ? value : "";
     }
 
     private static string GetElementText(JsonElement value)
@@ -484,23 +635,49 @@ internal sealed record SellerDetails(
     string RegistrationNumber);
 
 internal sealed record ProductDetails(
+    long ImtId,
+    string CardName,
+    string BrandName,
+    string Composition,
+    string PackageCount,
+    string CapsuleTabletCount,
+    string Taste,
+    string SupplementPurpose,
+    string CountryOfOrigin,
     string MainInfo,
     string ExtraInfo,
     string Description,
     string Documents);
 
+internal sealed record FeedbackDetails(
+    decimal? Rating,
+    int? ReviewCount);
+
 internal static class ExcelWriter
 {
+    private const int SellerUrlColumn = 21;
+    private const int ProductUrlColumn = 22;
+
     private static readonly string[] Headers =
     [
         "Файл",
-        "ID товара",
+        "Артикул WB",
         "Название товара",
+        "Бренд",
+        "Рейтинг",
+        "Количество отзывов",
+        "Количество вопросов",
         "Категория",
         "ID категории",
         "Родительская категория",
         "ID родительской категории",
         "Тип товара (entity)",
+        "Состав",
+        "Количество упаковок",
+        "Количество капсул/таблеток",
+        "Вкус",
+        "Назначение добавки",
+        "Страна производства",
         "ID продавца",
         "Название продавца на WB",
         "Ссылка на продавца",
@@ -535,38 +712,84 @@ internal static class ExcelWriter
             var row = rows[i];
             var excelRow = i + 2;
 
-            worksheet.Cell(excelRow, 1).Value = row.SourceFile;
-            worksheet.Cell(excelRow, 2).Value = row.ProductId;
-            worksheet.Cell(excelRow, 3).Value = row.ProductName;
-            worksheet.Cell(excelRow, 4).Value = row.Category;
-            worksheet.Cell(excelRow, 5).Value = row.CategoryId;
-            worksheet.Cell(excelRow, 6).Value = row.ParentCategory;
-            worksheet.Cell(excelRow, 7).Value = row.ParentCategoryId;
-            worksheet.Cell(excelRow, 8).Value = row.Entity;
-            worksheet.Cell(excelRow, 9).Value = row.SellerId;
-            worksheet.Cell(excelRow, 10).Value = row.SellerName;
-            worksheet.Cell(excelRow, 11).Value = row.SellerUrl;
-            worksheet.Cell(excelRow, 12).Value = row.ProductUrl;
-            worksheet.Cell(excelRow, 13).Value = row.SellerFullName;
-            worksheet.Cell(excelRow, 14).Value = row.Inn;
-            worksheet.Cell(excelRow, 15).Value = row.RegistrationNumber;
-            worksheet.Cell(excelRow, 16).Value = row.MainInfo;
-            worksheet.Cell(excelRow, 17).Value = row.ExtraInfo;
-            worksheet.Cell(excelRow, 18).Value = row.Description;
-            worksheet.Cell(excelRow, 19).Value = row.Documents;
+            object?[] values =
+            [
+                row.SourceFile,
+                row.ProductId,
+                row.ProductName,
+                row.BrandName,
+                row.Rating,
+                row.ReviewCount,
+                row.QuestionCount,
+                row.Category,
+                row.CategoryId,
+                row.ParentCategory,
+                row.ParentCategoryId,
+                row.Entity,
+                row.Composition,
+                row.PackageCount,
+                row.CapsuleTabletCount,
+                row.Taste,
+                row.SupplementPurpose,
+                row.CountryOfOrigin,
+                row.SellerId,
+                row.SellerName,
+                row.SellerUrl,
+                row.ProductUrl,
+                row.SellerFullName,
+                row.Inn,
+                row.RegistrationNumber,
+                row.MainInfo,
+                row.ExtraInfo,
+                row.Description,
+                row.Documents
+            ];
 
-            worksheet.Cell(excelRow, 11).SetHyperlink(new XLHyperlink(row.SellerUrl));
-            worksheet.Cell(excelRow, 12).SetHyperlink(new XLHyperlink(row.ProductUrl));
+            for (var col = 0; col < values.Length; col++)
+                SetCellValue(worksheet.Cell(excelRow, col + 1), values[col]);
+
+            worksheet.Cell(excelRow, SellerUrlColumn).SetHyperlink(new XLHyperlink(row.SellerUrl));
+            worksheet.Cell(excelRow, ProductUrlColumn).SetHyperlink(new XLHyperlink(row.ProductUrl));
         }
 
         worksheet.SheetView.FreezeRows(1);
         worksheet.RangeUsed()?.SetAutoFilter();
         worksheet.Columns().AdjustToContents();
-        worksheet.Columns(16, 19).Width = 45;
-        worksheet.Columns(16, 19).Style.Alignment.WrapText = true;
+        worksheet.Columns(13, 18).Width = 30;
+        worksheet.Columns(13, 18).Style.Alignment.WrapText = true;
+        worksheet.Columns(26, 29).Width = 45;
+        worksheet.Columns(26, 29).Style.Alignment.WrapText = true;
         worksheet.Rows().Style.Alignment.Vertical = XLAlignmentVerticalValues.Top;
 
         workbook.SaveAs(outputPath);
+    }
+
+    private static void SetCellValue(IXLCell cell, object? value)
+    {
+        switch (value)
+        {
+            case null:
+                cell.Clear();
+                break;
+            case string stringValue:
+                cell.Value = stringValue;
+                break;
+            case int intValue:
+                cell.Value = intValue;
+                break;
+            case long longValue:
+                cell.Value = longValue;
+                break;
+            case decimal decimalValue:
+                cell.Value = decimalValue;
+                break;
+            case double doubleValue:
+                cell.Value = doubleValue;
+                break;
+            default:
+                cell.Value = value.ToString() ?? "";
+                break;
+        }
     }
 }
 
